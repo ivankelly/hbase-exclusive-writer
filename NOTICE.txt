@@ -1,0 +1,2 @@
+HBase Exclusive Writer
+Copyright 2015 Ivan Kelly
