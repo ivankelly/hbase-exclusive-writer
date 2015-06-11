@@ -26,8 +26,10 @@ import java.util.Set;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.Admin;
+import org.apache.hadoop.hbase.client.Connection;
 import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.Mutation;
+import org.apache.hadoop.hbase.client.Table;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.slf4j.Logger;
@@ -41,17 +43,17 @@ public class HBaseExclusiveWriter {
     final static byte[] seqKeyBytes = Bytes.toBytes("-seqKey");
     final static byte[] seqKeyCol = Bytes.toBytes("exclusiveWriterSequence");
     final static String seqAttrName = "writerSeq";
-    
+
     static byte[] sequenceNumberKey(byte[] startKey) {
         return Bytes.add(startKey, seqKeyBytes);
     }
 
-    static HBaseExclusiveWriter acquire(HTable table,
-                                        long writerSequenceNumber) throws IOException {
-        Admin admin = table.getConnection().getAdmin();
-        TableName name = TableName.valueOf(table.getTableName());
-        Set<byte[]> cfs = admin.getTableDescriptor(name).getFamiliesKeys();
-        List<HRegionInfo> regions = admin.getTableRegions(name);
+    public static HBaseExclusiveWriter acquire(Connection conn, TableName tableName,
+                                               long writerSequenceNumber) throws IOException {
+        Admin admin = conn.getAdmin();
+        Table table = conn.getTable(tableName);
+        Set<byte[]> cfs = admin.getTableDescriptor(tableName).getFamiliesKeys();
+        List<HRegionInfo> regions = admin.getTableRegions(tableName);
         List<Put> puts = new ArrayList<Put>();
         byte[] seqBytes = Bytes.toBytes(writerSequenceNumber);
         for (HRegionInfo r : regions) {
@@ -62,9 +64,11 @@ public class HBaseExclusiveWriter {
             puts.add(p);
         }
         table.put(puts);
-        table.flushCommits();
+        if (table instanceof HTable) {
+            ((HTable)table).flushCommits();
+        }
 
-        List<HRegionInfo> regions2 = admin.getTableRegions(name);
+        List<HRegionInfo> regions2 = admin.getTableRegions(tableName);
         if (!regions2.containsAll(regions) ||
                 !regions.containsAll(regions2)) {
             throw new IOException("Regions changed during acquisition");
