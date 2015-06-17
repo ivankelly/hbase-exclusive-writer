@@ -28,19 +28,18 @@ import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.TableName;
+import org.apache.hadoop.hbase.client.Admin;
 import org.apache.hadoop.hbase.client.Connection;
 import org.apache.hadoop.hbase.client.ConnectionFactory;
-import org.apache.hadoop.hbase.client.HBaseAdmin;
-import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.RegionLocator;
+import org.apache.hadoop.hbase.client.Table;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -53,7 +52,7 @@ public class TestHBaseExclusiveWriter {
     final static byte[] testCF = Bytes.toBytes("testCF");
     final static byte[] testColumn = Bytes.toBytes("testColumn");
 
-    HBaseAdmin admin = null;
+    Admin admin = null;
     Random r = new Random();
     @BeforeClass
     public static void startCluster() throws Exception {
@@ -71,9 +70,10 @@ public class TestHBaseExclusiveWriter {
         admin = testUtil.getHBaseAdmin();
         testUtil.getConfiguration().setInt("hbase.client.retries.number", 10);
 
-        HTableDescriptor tableDesc = new HTableDescriptor(testTable)
+        HTableDescriptor tableDesc = new HTableDescriptor(testTableName)
             .addCoprocessor(HBaseExclusiveWriterCoprocessor.class.getName())
-            .addFamily(new HColumnDescriptor(testCF));
+            .addFamily(new HColumnDescriptor(testCF))
+            .addFamily(new HColumnDescriptor(HBaseExclusiveWriter.seqKeyCF));
         admin.createTable(tableDesc);
 
     }
@@ -83,12 +83,12 @@ public class TestHBaseExclusiveWriter {
         admin.disableTable(testTableName);
         admin.deleteTable(testTableName);
     }
-    
+
     @Test
     public void testWriterExclusion() throws Exception {
-
-        Connection connection1 = ConnectionFactory.createConnection(testUtil.getConfiguration());
-        HTable table1 = (HTable)connection1.getTable(TableName.valueOf(testTable));
+        Connection connection1 = ConnectionFactory.createConnection(
+                testUtil.getConfiguration());
+        Table table1 = connection1.getTable(testTableName);
 
         try {
             Put p = new Put(Bytes.toBytes(r.nextInt()))
@@ -99,16 +99,19 @@ public class TestHBaseExclusiveWriter {
             // correct behaviour
         }
 
-        HBaseExclusiveWriter writer1 = HBaseExclusiveWriter.acquire(table1, 1);
+        HBaseExclusiveWriter writer1 = HBaseExclusiveWriter.acquire(
+                connection1, testTableName, 1);
 
         Put p = writer1.setWriterSeqNo(new Put(Bytes.toBytes(r.nextInt())))
             .addColumn(testCF, testColumn, Bytes.toBytes(r.nextInt()));
         table1.put(p); // should work
 
-        Connection connection2 = ConnectionFactory.createConnection(testUtil.getConfiguration());
-        HTable table2 = (HTable)connection2.getTable(TableName.valueOf(testTable));
+        Connection connection2 = ConnectionFactory.createConnection(
+                testUtil.getConfiguration());
+        Table table2 = connection2.getTable(TableName.valueOf(testTable));
 
-        HBaseExclusiveWriter writer2 = HBaseExclusiveWriter.acquire(table2, 2);
+        HBaseExclusiveWriter writer2 = HBaseExclusiveWriter.acquire(connection2,
+                                                                    testTableName, 2);
 
         try {
             Put p2 = writer1.setWriterSeqNo(new Put(Bytes.toBytes(r.nextInt())))
@@ -118,7 +121,7 @@ public class TestHBaseExclusiveWriter {
         } catch (IOException ioe) {
             // should fail
         }
-            
+
         Put p3 = writer2.setWriterSeqNo(new Put(Bytes.toBytes(r.nextInt())))
             .addColumn(testCF, testColumn, Bytes.toBytes(r.nextInt()));
         table2.put(p3); // should work
@@ -138,18 +141,20 @@ public class TestHBaseExclusiveWriter {
             Thread.sleep(1000);
         }
         assertEquals(locator.getAllRegionLocations().size(), 2);
-        
-        HTable table1 = (HTable)connection1.getTable(TableName.valueOf(testTable));
 
-        HBaseExclusiveWriter writer1 = HBaseExclusiveWriter.acquire(table1, 1);
+        Table table1 = connection1.getTable(TableName.valueOf(testTable));
+
+        HBaseExclusiveWriter writer1 = HBaseExclusiveWriter.acquire(connection1,
+                                                                    testTableName, 1);
         Put p = writer1.setWriterSeqNo(new Put(Bytes.toBytes(r.nextInt())))
             .addColumn(testCF, testColumn, Bytes.toBytes(r.nextInt()));
         table1.put(p); // should work
 
         Connection connection2 = ConnectionFactory.createConnection(testUtil.getConfiguration());
-        HTable table2 = (HTable)connection2.getTable(TableName.valueOf(testTable));
+        Table table2 = connection2.getTable(TableName.valueOf(testTable));
 
-        HBaseExclusiveWriter writer2 = HBaseExclusiveWriter.acquire(table1, 2);
+        HBaseExclusiveWriter writer2 = HBaseExclusiveWriter.acquire(connection2,
+                                                                    testTableName, 2);
 
         byte[] regionName = locator.getRegionLocation(Bytes.toBytes("key101"))
             .getRegionInfo().getRegionName();

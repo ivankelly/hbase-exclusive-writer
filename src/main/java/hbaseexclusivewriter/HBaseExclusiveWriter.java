@@ -18,17 +18,28 @@
  */
 package hbaseexclusivewriter;
 
+import hbaseexclusivewriter.proto.WriterSeqProto.ErrorCode;
+import hbaseexclusivewriter.proto.WriterSeqProto.UpdateWriterSeqRequest;
+import hbaseexclusivewriter.proto.WriterSeqProto.WriterSeqResponse;
+import hbaseexclusivewriter.proto.WriterSeqProto.WriterSeqUpdate;
+
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.Admin;
+import org.apache.hadoop.hbase.client.Connection;
+import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.Put;
+import org.apache.hadoop.hbase.client.Table;
+import org.apache.hadoop.hbase.client.coprocessor.Batch;
+import org.apache.hadoop.hbase.ipc.BlockingRpcCallback;
+import org.apache.hadoop.hbase.ipc.ServerRpcController;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -38,33 +49,89 @@ public class HBaseExclusiveWriter {
 
     private final byte[] writerSequenceNumberBytes;
 
-    final static byte[] seqKeyBytes = Bytes.toBytes("-seqKey");
-    final static byte[] seqKeyCol = Bytes.toBytes("exclusiveWriterSequence");
+    public final static byte[] seqKeyRow = Bytes.toBytes("seqKey");
+    public final static byte[] seqKeyCF = Bytes.toBytes("exclusiveWriter");
+    public final static byte[] seqKeyCol = Bytes.toBytes("exclusiveWriterSequence");
     final static String seqAttrName = "writerSeq";
-    
+
     static byte[] sequenceNumberKey(byte[] startKey) {
-        return Bytes.add(startKey, seqKeyBytes);
+        return Bytes.add(startKey, seqKeyRow);
     }
 
-    static HBaseExclusiveWriter acquire(HTable table,
-                                        long writerSequenceNumber) throws IOException {
-        Admin admin = table.getConnection().getAdmin();
-        TableName name = TableName.valueOf(table.getTableName());
-        Set<byte[]> cfs = admin.getTableDescriptor(name).getFamiliesKeys();
-        List<HRegionInfo> regions = admin.getTableRegions(name);
-        List<Put> puts = new ArrayList<Put>();
-        byte[] seqBytes = Bytes.toBytes(writerSequenceNumber);
-        for (HRegionInfo r : regions) {
-            Put p = new Put(sequenceNumberKey(r.getStartKey()));
-            for (byte[] cf : cfs) {
-                p.addColumn(cf, seqKeyCol, seqBytes);
-            }
-            puts.add(p);
-        }
-        table.put(puts);
-        table.flushCommits();
+    public static HBaseExclusiveWriter acquire(Connection conn,
+                                               TableName tableName,
+                                               long writerSequenceNumber)
+            throws IOException {
+        Admin admin = conn.getAdmin();
+        Table table = conn.getTable(tableName);
 
-        List<HRegionInfo> regions2 = admin.getTableRegions(name);
+        // get current value
+        Get get = new Get(seqKeyRow).addColumn(seqKeyCF, seqKeyCol);
+        byte[] currentSeqBytes = table.get(get).getValue(seqKeyCF, seqKeyCol);
+        if (currentSeqBytes != null) {
+            Long currentSeq  = Bytes.toLong(currentSeqBytes);
+            if (currentSeq > writerSequenceNumber) {
+                throw new IOException(
+                        "Current table writer sequence is higher that requested sequence");
+            }
+        }
+        Put put = new Put(seqKeyRow).addColumn(seqKeyCF, seqKeyCol,
+                                               Bytes.toBytes(writerSequenceNumber));
+        table.put(put);
+        if (table instanceof HTable) {
+            ((HTable)table).flushCommits();
+        }
+
+        List<HRegionInfo> regions = admin.getTableRegions(tableName);
+        final UpdateWriterSeqRequest req = UpdateWriterSeqRequest
+            .newBuilder().build();
+        final ServerRpcController controller = new ServerRpcController();
+        try {
+            final AtomicInteger errors = new AtomicInteger(0);
+            Map<byte[], WriterSeqResponse> results
+                = table.coprocessorService(WriterSeqUpdate.class,
+                        null, null,
+                        new Batch.Call<WriterSeqUpdate, WriterSeqResponse>() {
+                    @Override
+                    public WriterSeqResponse call(
+                            WriterSeqUpdate service) throws IOException {
+                        try {
+                            BlockingRpcCallback<WriterSeqResponse> rpcCallback = new BlockingRpcCallback<WriterSeqResponse>();
+                            service.update(controller, req, rpcCallback);
+                            WriterSeqResponse ret = rpcCallback.get();
+                            if (ret == null) {
+                                errors.incrementAndGet();
+                            }
+                            return ret;
+                        } catch (Throwable t) {
+                            errors.incrementAndGet();
+                            throw t;
+                        }
+                    }
+                });
+            if (errors.get() > 0) {
+                throw new IOException(
+                        "Error contacting exclusive writer service");
+            }
+            for (Map.Entry<byte[],WriterSeqResponse> r : results.entrySet()) {
+                if (r.getValue().getErrorCode() == ErrorCode.OK
+                    && r.getValue().hasSeqNum()) {
+                    if (r.getValue().getSeqNum() != writerSequenceNumber) {
+                        throw new IOException("Sequence number not updated "
+                                + "(wanted: " + writerSequenceNumber + ", got: "
+                                + r.getValue().getSeqNum() + ")");
+                    }
+                } else {
+                    throw new IOException("Error " + r.getValue().getErrorCode()
+                                          + " updating writer sequence on region "
+                                          + Bytes.toString(r.getKey()));
+                }
+            }
+        } catch (Throwable t) {
+            throw new IOException("Exception accessing writer seq service", t);
+        }
+
+        List<HRegionInfo> regions2 = admin.getTableRegions(tableName);
         if (!regions2.containsAll(regions) ||
                 !regions.containsAll(regions2)) {
             throw new IOException("Regions changed during acquisition");
@@ -81,5 +148,3 @@ public class HBaseExclusiveWriter {
         return mutation;
     }
 }
-
-    
